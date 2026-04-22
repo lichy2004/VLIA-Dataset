@@ -18,6 +18,7 @@ NUM_HAND_JOINTS = len(HAND_KEYPOINT_NAMES)
 
 LEFT_HAND_COLOR = (100, 180, 255)
 RIGHT_HAND_COLOR = (255, 150, 100)
+GAZE_COLOR = (0, 255, 0)
 
 
 # -----------------------------------------------------------------------------
@@ -173,27 +174,41 @@ def _render_frame_3d(server, cam_img, cam_tf, left_frame, right_frame):
         _render_hand_3d(server, '/right', right_frame, RIGHT_HAND_COLOR)
 
 
-def vis_3d_keypoint(cam_img, cam_ext, hand_tfs, port=8080):
+
+def vis_3d_keypoint(cam_img, cam_ext, hand, gaze=None, mask=None, port=8080):
     """Visualize global camera/hand transforms in 3D.
 
     Args:
         cam_img: np.ndarray [T, H, W, 3]
         cam_ext: np.ndarray [T, 4, 4], camera pose in global frame
-        hand_tfs: {
-            'camera': np.ndarray [T,4,4],
+        hand: {
             'left': {'joint_name': np.ndarray [T,4,4], ...} or None,
             'right': {'joint_name': np.ndarray [T,4,4], ...} or None,
         }
+        gaze: np.ndarray [T,2] image pixel coordinates (optional)
+        mask: {'left': np.ndarray [T], 'right': np.ndarray [T], 'gaze': np.ndarray [T]} (optional)
     """
     cam_tfs = np.asarray(cam_ext, dtype=np.float32)
-    left_data = hand_tfs.get('left', {})
-    right_data = hand_tfs.get('right', {})
+    left_data = hand.get('left') if hand is not None else None
+    right_data = hand.get('right') if hand is not None else None
     total_frames = cam_img.shape[0]
 
-    if cam_tfs.ndim != 3 or cam_tfs.shape[1:] != (4, 4):
-        raise ValueError(f'Expected cam_ext shape [T,4,4], got {cam_tfs.shape}')
     if cam_tfs.shape[0] != total_frames:
         raise ValueError('cam_img and cam_ext frame count mismatch')
+
+    if mask is None:
+        left_mask = np.ones(total_frames, dtype=bool)
+        right_mask = np.ones(total_frames, dtype=bool)
+        gaze_mask = np.ones(total_frames, dtype=bool)
+    else:
+        left_mask = np.asarray(mask.get('left', np.ones(total_frames)), dtype=bool)
+        right_mask = np.asarray(mask.get('right', np.ones(total_frames)), dtype=bool)
+        gaze_mask = np.asarray(mask.get('gaze', np.ones(total_frames)), dtype=bool)
+
+    if gaze is not None:
+        gaze = np.asarray(gaze, dtype=np.float32)
+        if gaze.shape[0] != total_frames:
+            raise ValueError(f'gaze frame count mismatch: expected {total_frames}, got {gaze.shape[0]}')
 
     def _get_hand_frame(hand_data, t):
         if not hand_data:
@@ -205,12 +220,23 @@ def vis_3d_keypoint(cam_img, cam_ext, hand_tfs, port=8080):
 
     def update_frame(t):
         with server.atomic():
+            left_frame = _get_hand_frame(left_data, t) if left_mask[t] else None
+            right_frame = _get_hand_frame(right_data, t) if right_mask[t] else None
+            cam_frame = cam_img[t].copy()
+            if gaze is not None and gaze_mask[t] and np.all(np.isfinite(gaze[t])):
+                gx, gy = np.round(gaze[t]).astype(np.int32)
+                gx, gy = int(gx), int(gy)
+                cross_size = 10
+                thickness = 3
+                cv2.line(cam_frame, (gx - cross_size, gy), (gx + cross_size, gy), GAZE_COLOR, thickness, lineType=cv2.LINE_AA)
+                cv2.line(cam_frame, (gx, gy - cross_size), (gx, gy + cross_size), GAZE_COLOR, thickness, lineType=cv2.LINE_AA)
+
             _render_frame_3d(
                 server,
-                cam_img[t],
+                cam_frame,
                 cam_tfs[t],
-                _get_hand_frame(left_data, t),
-                _get_hand_frame(right_data, t),
+                left_frame,
+                right_frame,
             )
 
     if total_frames > 1:
@@ -250,6 +276,17 @@ def _project_vlia_points_to_pixels(points_vlia, cam_int, eps=1e-6):
     return uv, valid
 
 
+def _transform_hand_to_camera_frame(hand_frame_tfs, cam_ext):
+    if not hand_frame_tfs:
+        return None
+
+    cam_from_world = np.linalg.inv(cam_ext)
+    return {
+        name: cam_from_world @ tf_world
+        for name, tf_world in hand_frame_tfs.items()
+    }
+
+
 def _draw_hand_keypoint_overlay(frame, hand_frame_tfs, color, cam_int):
     if not hand_frame_tfs:
         return
@@ -282,24 +319,50 @@ def _draw_hand_keypoint_overlay(frame, hand_frame_tfs, color, cam_int):
         cv2.circle(frame, c, 3, color, -1, lineType=cv2.LINE_AA)
 
 
-def vis_2d_keypoint(cam_img, cam_int, hand_keypoint, save_path=None, fps=30):
-    """Overlay hand keypoint skeletons on image frames.
+def vis_2d_keypoint(cam_img, cam_int, cam_ext, hand, gaze=None, mask=None, save_path=None, fps=30):
+    """Overlay hand keypoint skeletons and gaze point on image frames.
 
     Args:
         cam_img: np.ndarray [T, H, W, 3]
         cam_int: np.ndarray [3, 3]
-        hand_keypoint: {
+        cam_ext: np.ndarray [T, 4, 4], camera pose in global/world frame
+        hand: {
             'left': {'joint_name': np.ndarray [T, 4, 4], ...} or None,
             'right': {'joint_name': np.ndarray [T, 4, 4], ...} or None,
         }
+        gaze: np.ndarray [T,2] image pixel coordinates (optional)
+        mask: {'left': np.ndarray [T], 'right': np.ndarray [T], 'gaze': np.ndarray [T]} (optional)
+        All hand transforms are in global/world frame and will be converted
+        to current-frame camera coordinates before projection.
     """
-    cam_int = np.asarray(cam_int)
-    if cam_int.shape != (3, 3):
-        raise ValueError(f'Expected cam_int shape [3,3], got {cam_int.shape}')
+    cam_int = np.asarray(cam_int, dtype=np.float32)
+    cam_ext = np.asarray(cam_ext, dtype=np.float32)
 
     total_frames = cam_img.shape[0]
-    left_data = hand_keypoint.get('left')
-    right_data = hand_keypoint.get('right')
+    if cam_ext.shape[0] != total_frames:
+        raise ValueError(f'cam_ext frame count mismatch: expected {total_frames}, got {cam_ext.shape[0]}')
+
+    try:
+        cam_int_frames = np.broadcast_to(cam_int, (total_frames, 3, 3)).astype(np.float32, copy=False)
+    except ValueError as exc:
+        raise ValueError(f'Expected cam_int shape [3,3], got {cam_int.shape}') from exc
+
+    left_data = hand.get('left') if hand is not None else None
+    right_data = hand.get('right') if hand is not None else None
+
+    if mask is None:
+        left_mask = np.ones(total_frames, dtype=bool)
+        right_mask = np.ones(total_frames, dtype=bool)
+        gaze_mask = np.ones(total_frames, dtype=bool)
+    else:
+        left_mask = np.asarray(mask.get('left', np.ones(total_frames)), dtype=bool)
+        right_mask = np.asarray(mask.get('right', np.ones(total_frames)), dtype=bool)
+        gaze_mask = np.asarray(mask.get('gaze', np.ones(total_frames)), dtype=bool)
+
+    if gaze is not None:
+        gaze = np.asarray(gaze, dtype=np.float32)
+        if gaze.shape[0] != total_frames:
+            raise ValueError(f'gaze frame count mismatch: expected {total_frames}, got {gaze.shape[0]}')
 
     def _get_frame_dict(side_data, t):
         if not side_data:
@@ -309,8 +372,24 @@ def vis_2d_keypoint(cam_img, cam_int, hand_keypoint, save_path=None, fps=30):
     rendered = []
     for t in range(total_frames):
         frame = cam_img[t].copy()
-        _draw_hand_keypoint_overlay(frame, _get_frame_dict(left_data, t), LEFT_HAND_COLOR, cam_int)
-        _draw_hand_keypoint_overlay(frame, _get_frame_dict(right_data, t), RIGHT_HAND_COLOR, cam_int)
+
+        left_world = _get_frame_dict(left_data, t) if left_mask[t] else None
+        right_world = _get_frame_dict(right_data, t) if right_mask[t] else None
+
+        left_cam = _transform_hand_to_camera_frame(left_world, cam_ext[t])
+        right_cam = _transform_hand_to_camera_frame(right_world, cam_ext[t])
+
+        _draw_hand_keypoint_overlay(frame, left_cam, LEFT_HAND_COLOR, cam_int_frames[t])
+        _draw_hand_keypoint_overlay(frame, right_cam, RIGHT_HAND_COLOR, cam_int_frames[t])
+
+        if gaze is not None and gaze_mask[t] and np.all(np.isfinite(gaze[t])):
+            gx, gy = np.round(gaze[t]).astype(np.int32)
+            gx, gy = int(gx), int(gy)
+            cross_size = 6
+            thickness = 2
+            cv2.line(frame, (gx - cross_size, gy), (gx + cross_size, gy), GAZE_COLOR, thickness, lineType=cv2.LINE_AA)
+            cv2.line(frame, (gx, gy - cross_size), (gx, gy + cross_size), GAZE_COLOR, thickness, lineType=cv2.LINE_AA)
+
         rendered.append(frame)
 
     rendered = np.asarray(rendered)

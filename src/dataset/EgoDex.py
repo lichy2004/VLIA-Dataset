@@ -78,6 +78,7 @@ def process_hand_keypoint(data, root):
 
     joint_tfs_world["camera"] = root["/transforms/camera"][:]
 
+    # global coordinate rotation
     camera_tfs_first = joint_tfs_world["camera"][0:1]
     camera_tfs_first = (
         camera_tfs_first
@@ -85,18 +86,21 @@ def process_hand_keypoint(data, root):
         @ create_rotation_transform("z", 90)
     )
 
+    # first frame align
     joint_tfs_camera = {}
     camera_tfs_first_inv = np.linalg.inv(camera_tfs_first)
     for joint_name, joint_tf in joint_tfs_world.items():
         joint_tfs_camera[joint_name] = camera_tfs_first_inv @ joint_tf
 
+    # local coordinate rotation
     joint_tfs_camera["camera"] = (
         joint_tfs_camera["camera"]
         @ create_rotation_transform("x", -90)
         @ create_rotation_transform("z", 90)
     )
-    joint_tfs_camera["left_wrist"] = joint_tfs_camera["left_wrist"] @ create_rotation_transform(
-        "x", -90
+    joint_tfs_camera["left_wrist"] = (
+        joint_tfs_camera["left_wrist"] 
+        @ create_rotation_transform("x", -90)
     )
     joint_tfs_camera["right_wrist"] = (
         joint_tfs_camera["right_wrist"]
@@ -104,6 +108,7 @@ def process_hand_keypoint(data, root):
         @ create_rotation_transform("x", 90)
     )
 
+    # save hand keypoint
     left_hand_tfs = {}
     right_hand_tfs = {}
     for hand_name in HAND_KEYPOINT_NAMES:
